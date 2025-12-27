@@ -21,7 +21,7 @@ By "SELinux bypass" I mean the payload will run in init domian even if SELinux i
 
 ## Building
 
-Pre-built binaries are available on the release page. Otherwise, just add NDK standalone toolchain into `PATH` and run `make`.
+Pre-built binaries are available on the release page. Otherwise, just add NDK standalone toolchain into `PATH` and run `make`. Build outputs are placed under `build/` (for example, `build/rmi`).
 
 ## Usage
 
