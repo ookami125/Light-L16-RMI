@@ -84,6 +84,20 @@ Errors:
 Notes:
 - This variant uses `/system/bin/input keyevent` instead of writing to `/dev/input/eventX`.
 
+### `OPEN`
+
+Request payload:
+- `OPEN <target>`
+
+Response:
+- `OK`
+
+Errors:
+- `ERR open` if the app cannot be launched
+
+Notes:
+- `<target>` may be a component (`package/.Activity`) or a package name.
+
 ### `UPLOAD`
 
 Request payload:

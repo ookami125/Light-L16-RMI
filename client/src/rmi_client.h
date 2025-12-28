@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstddef>
 #include <condition_variable>
+#include <memory>
 #include <mutex>
 #include <cstdint>
 #include <queue>
@@ -48,8 +49,13 @@ class RmiClient {
   void sendPress(int keycode);
   void sendVersion();
   void sendPressInput(int keycode);
+  void sendOpen(const std::string& target);
   void sendUpload(const std::string& local_path, const std::string& remote_path);
   void sendUploadAndRestart(const std::string& local_path, const std::string& remote_path);
+  bool sendRawCommand(const std::string& command,
+                      std::string* response,
+                      std::string* error,
+                      int timeout_ms = 3000);
 
   ClientStatus status() const;
   std::string statusLabel() const;
@@ -86,8 +92,11 @@ class RmiClient {
     Screencap,
     Version,
     List,
-    Download
+    Download,
+    Raw
   };
+
+  struct RawResponse;
 
   struct OutboundMessage {
     std::string message;
@@ -99,6 +108,17 @@ class RmiClient {
     std::string upload_remote_path;
     std::string list_path;
     std::string download_path;
+    std::shared_ptr<RawResponse> raw_response;
+    int raw_timeout_ms = 0;
+  };
+
+  struct RawResponse {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool done = false;
+    bool ok = false;
+    std::string payload;
+    std::string error;
   };
 
   void workerLoop(ClientConfig config);

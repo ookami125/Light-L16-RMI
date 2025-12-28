@@ -32,6 +32,7 @@ else()
 endif()
 
 find_package(SDL2 REQUIRED)
+find_package(Lua)
 
 if (EXISTS "${IMGUI_DIR}/backends/imgui_impl_sdlrenderer2.cpp")
   set(IMGUI_SDL_RENDERER_BACKEND "sdlrenderer2")
@@ -48,6 +49,7 @@ add_executable(rmi_client
   src/rmi_client.cpp
   src/net.cpp
   src/stb_image.cpp
+  third_party/ImGuiColorTextEdit/TextEditor.cpp
   ${IMGUI_DIR}/imgui.cpp
   ${IMGUI_DIR}/imgui_draw.cpp
   ${IMGUI_DIR}/imgui_tables.cpp
@@ -69,6 +71,7 @@ target_include_directories(rmi_client PRIVATE
   ${IMGUI_DIR}/backends
   ${IMGUI_DIR}/misc/cpp
   src
+  third_party/ImGuiColorTextEdit
   ${CMAKE_CURRENT_SOURCE_DIR}/../protocol
 )
 
@@ -86,6 +89,14 @@ if (TARGET SDL2::SDL2)
 else()
   target_include_directories(rmi_client PRIVATE ${SDL2_INCLUDE_DIRS})
   target_link_libraries(rmi_client PRIVATE ${SDL2_LIBRARIES})
+endif()
+
+if (Lua_FOUND)
+  target_compile_definitions(rmi_client PRIVATE RMI_ENABLE_LUA)
+  target_include_directories(rmi_client PRIVATE ${LUA_INCLUDE_DIR})
+  target_link_libraries(rmi_client PRIVATE ${LUA_LIBRARIES})
+else()
+  message(STATUS "Lua not found; Lua scripting disabled.")
 endif()
 
 target_link_libraries(rmi_client PRIVATE rmi_protocol)

@@ -40,9 +40,18 @@
 #error "Unknown SDL renderer backend for Dear ImGui"
 #endif
 #include "imgui_stdlib.h"
+#include "TextEditor.h"
 
 #include "rmi_client.h"
 #include "stb_image.h"
+
+#if defined(RMI_ENABLE_LUA)
+extern "C" {
+#include <lauxlib.h>
+#include <lua.h>
+#include <lualib.h>
+}
+#endif
 
 enum class DownloadAction {
   None = 0,
@@ -169,6 +178,35 @@ struct SettingsState {
   std::string error;
   bool dirty = false;
   Uint64 last_change_ticks = 0;
+  float ui_scale = 1.0f;
+};
+
+struct LuaScript {
+  std::string name;
+  std::string code;
+  std::string path;
+  std::string last_error;
+  bool dirty = false;
+  std::unique_ptr<TextEditor> editor;
+};
+
+struct LuaKeybind {
+  SDL_Scancode scancode = SDL_SCANCODE_UNKNOWN;
+  SDL_Keymod mods = KMOD_NONE;
+  std::string script_name;
+};
+
+struct LuaState {
+  std::vector<LuaScript> scripts;
+  std::vector<LuaKeybind> keybinds;
+  std::filesystem::path scripts_dir;
+  int selected = -1;
+  std::string new_script_name;
+  std::string output;
+  size_t output_version = 0;
+  size_t output_last_version = 0;
+  std::string keybind_input;
+  int keybind_script = 0;
 };
 
 namespace {
@@ -910,6 +948,246 @@ std::filesystem::path SettingsPath() {
   return cwd / "client_settings.ini";
 }
 
+std::filesystem::path LuaScriptsDir() {
+  std::error_code fs_error;
+  std::filesystem::path cwd = std::filesystem::current_path(fs_error);
+  std::filesystem::path base_dir;
+  char* base = SDL_GetBasePath();
+  if (base) {
+    base_dir = std::filesystem::path(base);
+    SDL_free(base);
+  } else {
+    base_dir = cwd;
+  }
+  if (base_dir.empty()) {
+    base_dir = cwd;
+  }
+  return base_dir / "scripts";
+}
+
+void AppendLuaOutput(LuaState* state, const std::string& text) {
+  if (!state) {
+    return;
+  }
+  state->output += text;
+  if (!state->output.empty() && state->output.back() != '\n') {
+    state->output += '\n';
+  }
+  const size_t max_output = 16384;
+  if (state->output.size() > max_output) {
+    state->output.erase(0, state->output.size() - max_output);
+  }
+  state->output_version++;
+}
+
+std::string MakeUniqueScriptName(const LuaState& state, const std::string& base) {
+  if (base.empty()) {
+    return "script";
+  }
+  std::string candidate = base;
+  int suffix = 1;
+  auto exists = [&state](const std::string& name) {
+    for (const auto& script : state.scripts) {
+      if (script.name == name) {
+        return true;
+      }
+    }
+    return false;
+  };
+  while (exists(candidate)) {
+    candidate = base + "_" + std::to_string(suffix++);
+  }
+  return candidate;
+}
+
+int FindLuaScriptIndex(const LuaState& state, const std::string& name) {
+  for (size_t i = 0; i < state.scripts.size(); ++i) {
+    if (state.scripts[i].name == name) {
+      return static_cast<int>(i);
+    }
+  }
+  return -1;
+}
+
+void LoadLuaScripts(LuaState* state) {
+  if (!state) {
+    return;
+  }
+  state->scripts.clear();
+  state->selected = -1;
+  state->scripts_dir = LuaScriptsDir();
+
+  std::error_code fs_error;
+  if (std::filesystem::exists(state->scripts_dir, fs_error)) {
+    for (const auto& entry : std::filesystem::directory_iterator(state->scripts_dir, fs_error)) {
+      if (fs_error) {
+        break;
+      }
+      if (!entry.is_regular_file()) {
+        continue;
+      }
+      const std::filesystem::path path = entry.path();
+      if (path.extension() != ".lua") {
+        continue;
+      }
+      std::ifstream file(path);
+      if (!file) {
+        continue;
+      }
+      std::ostringstream content;
+      content << file.rdbuf();
+      LuaScript script;
+      script.name = path.stem().string();
+      script.code = content.str();
+      script.path = path.string();
+      state->scripts.push_back(std::move(script));
+    }
+  }
+
+  if (state->scripts.empty()) {
+    LuaScript script;
+    script.name = "example";
+    script.code =
+        "-- Example script\n"
+        "-- rmi.client_count() -> number of clients\n"
+        "-- rmi.screencap(1)\n"
+        "rmi.log(\"Lua ready\")\n";
+    state->scripts.push_back(std::move(script));
+  }
+  state->selected = 0;
+}
+
+bool SaveLuaScript(LuaState* state, LuaScript* script, std::string* error) {
+  if (!state || !script) {
+    if (error) {
+      *error = "Invalid script.";
+    }
+    return false;
+  }
+  if (script->name.empty()) {
+    if (error) {
+      *error = "Script name is empty.";
+    }
+    return false;
+  }
+  std::filesystem::path dir = state->scripts_dir.empty()
+      ? LuaScriptsDir()
+      : state->scripts_dir;
+  std::error_code fs_error;
+  std::filesystem::create_directories(dir, fs_error);
+  if (fs_error) {
+    if (error) {
+      *error = fs_error.message();
+    }
+    return false;
+  }
+  std::filesystem::path path = dir / (script->name + ".lua");
+  std::ofstream file(path, std::ios::trunc);
+  if (!file) {
+    if (error) {
+      *error = "Failed to write script file.";
+    }
+    return false;
+  }
+  file << script->code;
+  if (!file.good()) {
+    if (error) {
+      *error = "Failed to save script.";
+    }
+    return false;
+  }
+  script->path = path.string();
+  script->dirty = false;
+  return true;
+}
+
+bool ParseKeybindString(const std::string& text, SDL_Scancode* scancode, SDL_Keymod* mods) {
+  if (scancode) {
+    *scancode = SDL_SCANCODE_UNKNOWN;
+  }
+  if (mods) {
+    *mods = KMOD_NONE;
+  }
+  std::string token;
+  SDL_Keymod found_mods = KMOD_NONE;
+  SDL_Scancode found_scancode = SDL_SCANCODE_UNKNOWN;
+
+  auto flush_token = [&](const std::string& value) {
+    if (value.empty()) {
+      return;
+    }
+    std::string lower;
+    lower.reserve(value.size());
+    for (char c : value) {
+      lower.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+    }
+    if (lower == "ctrl" || lower == "control") {
+      found_mods = static_cast<SDL_Keymod>(found_mods | KMOD_CTRL);
+      return;
+    }
+    if (lower == "shift") {
+      found_mods = static_cast<SDL_Keymod>(found_mods | KMOD_SHIFT);
+      return;
+    }
+    if (lower == "alt") {
+      found_mods = static_cast<SDL_Keymod>(found_mods | KMOD_ALT);
+      return;
+    }
+    if (lower == "gui" || lower == "win" || lower == "meta") {
+      found_mods = static_cast<SDL_Keymod>(found_mods | KMOD_GUI);
+      return;
+    }
+    SDL_Scancode sc = SDL_GetScancodeFromName(value.c_str());
+    if (sc != SDL_SCANCODE_UNKNOWN) {
+      found_scancode = sc;
+    }
+  };
+
+  for (size_t i = 0; i <= text.size(); ++i) {
+    if (i == text.size() || text[i] == '+' || text[i] == ' ') {
+      std::string trimmed = TrimCopy(token);
+      flush_token(trimmed);
+      token.clear();
+    } else {
+      token.push_back(text[i]);
+    }
+  }
+
+  if (found_scancode == SDL_SCANCODE_UNKNOWN) {
+    return false;
+  }
+  if (scancode) {
+    *scancode = found_scancode;
+  }
+  if (mods) {
+    *mods = found_mods;
+  }
+  return true;
+}
+
+std::string FormatKeybind(const LuaKeybind& bind) {
+  std::string result;
+  if (bind.mods & KMOD_CTRL) {
+    result += "Ctrl+";
+  }
+  if (bind.mods & KMOD_SHIFT) {
+    result += "Shift+";
+  }
+  if (bind.mods & KMOD_ALT) {
+    result += "Alt+";
+  }
+  if (bind.mods & KMOD_GUI) {
+    result += "Gui+";
+  }
+  const char* key_name = SDL_GetScancodeName(bind.scancode);
+  if (key_name && *key_name) {
+    result += key_name;
+  } else {
+    result += "Unknown";
+  }
+  return result;
+}
+
 bool ResolveLocalRmiPath(std::filesystem::path* path_out, std::string* error) {
   std::error_code fs_error;
   std::filesystem::path cwd = std::filesystem::current_path(fs_error);
@@ -965,7 +1243,360 @@ bool ResolveLocalRmiPath(std::filesystem::path* path_out, std::string* error) {
   return false;
 }
 
-bool LoadSettings(ClientConfig* config, int* connect_tab, std::string* error) {
+#if defined(RMI_ENABLE_LUA)
+struct LuaContext {
+  LuaState* state = nullptr;
+  std::vector<std::unique_ptr<ClientSlot>>* slots = nullptr;
+};
+
+static const char kLuaContextKey = 0;
+
+LuaContext* GetLuaContext(lua_State* L) {
+  lua_pushlightuserdata(L, (void*)&kLuaContextKey);
+  lua_gettable(L, LUA_REGISTRYINDEX);
+  LuaContext* ctx = static_cast<LuaContext*>(lua_touserdata(L, -1));
+  lua_pop(L, 1);
+  return ctx;
+}
+
+ClientSlot* LuaGetSlot(lua_State* L, int index) {
+  LuaContext* ctx = GetLuaContext(L);
+  if (!ctx || !ctx->slots) {
+    luaL_error(L, "Lua context not initialized.");
+    return nullptr;
+  }
+  if (index < 1 || static_cast<size_t>(index) > ctx->slots->size()) {
+    luaL_error(L, "Client index out of range.");
+    return nullptr;
+  }
+  return (*ctx->slots)[static_cast<size_t>(index - 1)].get();
+}
+
+int LuaClientCount(lua_State* L) {
+  LuaContext* ctx = GetLuaContext(L);
+  if (!ctx || !ctx->slots) {
+    lua_pushinteger(L, 0);
+    return 1;
+  }
+  lua_pushinteger(L, static_cast<lua_Integer>(ctx->slots->size()));
+  return 1;
+}
+
+int LuaLog(lua_State* L) {
+  LuaContext* ctx = GetLuaContext(L);
+  const char* message = luaL_checkstring(L, 1);
+  if (ctx && ctx->state && message) {
+    AppendLuaOutput(ctx->state, message);
+  }
+  return 0;
+}
+
+int LuaIsConnected(lua_State* L) {
+  const int idx = static_cast<int>(luaL_checkinteger(L, 1));
+  ClientSlot* slot = LuaGetSlot(L, idx);
+  if (!slot) {
+    lua_pushboolean(L, 0);
+    return 1;
+  }
+  const ClientStatus status = slot->client.status();
+  lua_pushboolean(L, status == ClientStatus::Connected);
+  return 1;
+}
+
+int LuaConnect(lua_State* L) {
+  const int idx = static_cast<int>(luaL_checkinteger(L, 1));
+  ClientSlot* slot = LuaGetSlot(L, idx);
+  if (!slot) {
+    return 0;
+  }
+  const int top = lua_gettop(L);
+  if (top >= 5) {
+    slot->config.host = luaL_checkstring(L, 2);
+    slot->config.port = luaL_checkstring(L, 3);
+    slot->config.username = luaL_checkstring(L, 4);
+    slot->config.password = luaL_checkstring(L, 5);
+  }
+  slot->client.connect(slot->config);
+  return 0;
+}
+
+int LuaDisconnect(lua_State* L) {
+  const int idx = static_cast<int>(luaL_checkinteger(L, 1));
+  ClientSlot* slot = LuaGetSlot(L, idx);
+  if (slot) {
+    slot->client.disconnect();
+  }
+  return 0;
+}
+
+int LuaScreencap(lua_State* L) {
+  const int idx = static_cast<int>(luaL_checkinteger(L, 1));
+  ClientSlot* slot = LuaGetSlot(L, idx);
+  if (slot) {
+    slot->client.sendScreencap();
+  }
+  return 0;
+}
+
+int LuaVersion(lua_State* L) {
+  const int idx = static_cast<int>(luaL_checkinteger(L, 1));
+  ClientSlot* slot = LuaGetSlot(L, idx);
+  if (slot) {
+    slot->client.sendVersion();
+  }
+  return 0;
+}
+
+int LuaRestart(lua_State* L) {
+  const int idx = static_cast<int>(luaL_checkinteger(L, 1));
+  ClientSlot* slot = LuaGetSlot(L, idx);
+  if (slot) {
+    slot->client.sendRestart();
+  }
+  return 0;
+}
+
+int LuaQuit(lua_State* L) {
+  const int idx = static_cast<int>(luaL_checkinteger(L, 1));
+  ClientSlot* slot = LuaGetSlot(L, idx);
+  if (slot) {
+    slot->client.sendQuit();
+  }
+  return 0;
+}
+
+int LuaPress(lua_State* L) {
+  const int idx = static_cast<int>(luaL_checkinteger(L, 1));
+  const int keycode = static_cast<int>(luaL_checkinteger(L, 2));
+  ClientSlot* slot = LuaGetSlot(L, idx);
+  if (slot) {
+    slot->client.sendPressInput(keycode);
+  }
+  return 0;
+}
+
+int LuaUpload(lua_State* L) {
+  const int idx = static_cast<int>(luaL_checkinteger(L, 1));
+  const char* local_path = luaL_checkstring(L, 2);
+  const char* remote_path = luaL_checkstring(L, 3);
+  ClientSlot* slot = LuaGetSlot(L, idx);
+  if (slot && local_path && remote_path) {
+    slot->client.sendUpload(local_path, remote_path);
+  }
+  return 0;
+}
+
+int LuaSendRaw(lua_State* L) {
+  const int idx = static_cast<int>(luaL_checkinteger(L, 1));
+  const char* command = luaL_checkstring(L, 2);
+  int timeout_ms = 0;
+  if (lua_gettop(L) >= 3) {
+    timeout_ms = static_cast<int>(luaL_checkinteger(L, 3));
+  }
+  ClientSlot* slot = LuaGetSlot(L, idx);
+  if (!slot || !command) {
+    lua_pushnil(L);
+    lua_pushstring(L, "Invalid client or command.");
+    return 2;
+  }
+  std::string response;
+  std::string error;
+  if (!slot->client.sendRawCommand(command, &response, &error, timeout_ms)) {
+    lua_pushnil(L);
+    lua_pushstring(L, error.empty() ? "Raw command failed." : error.c_str());
+    return 2;
+  }
+  lua_pushlstring(L, response.c_str(), response.size());
+  return 1;
+}
+
+int LuaSleep(lua_State* L) {
+  const double seconds = luaL_checknumber(L, 1);
+  if (seconds <= 0.0) {
+    return 0;
+  }
+  std::this_thread::sleep_for(std::chrono::duration<double>(seconds));
+  return 0;
+}
+
+int LuaBindKey(lua_State* L) {
+  LuaContext* ctx = GetLuaContext(L);
+  const char* key = luaL_checkstring(L, 1);
+  const char* script = luaL_checkstring(L, 2);
+  if (!ctx || !ctx->state || !key || !script) {
+    return luaL_error(L, "Invalid keybind parameters.");
+  }
+  SDL_Scancode scancode = SDL_SCANCODE_UNKNOWN;
+  SDL_Keymod mods = KMOD_NONE;
+  if (!ParseKeybindString(key, &scancode, &mods)) {
+    return luaL_error(L, "Invalid keybind string.");
+  }
+  if (FindLuaScriptIndex(*ctx->state, script) < 0) {
+    return luaL_error(L, "Script not found.");
+  }
+  for (auto& bind : ctx->state->keybinds) {
+    if (bind.scancode == scancode && bind.mods == mods) {
+      bind.script_name = script;
+      return 0;
+    }
+  }
+  LuaKeybind bind;
+  bind.scancode = scancode;
+  bind.mods = mods;
+  bind.script_name = script;
+  ctx->state->keybinds.push_back(std::move(bind));
+  return 0;
+}
+
+int LuaClearKeybinds(lua_State* L) {
+  LuaContext* ctx = GetLuaContext(L);
+  if (ctx && ctx->state) {
+    ctx->state->keybinds.clear();
+  }
+  return 0;
+}
+
+void RegisterLuaApi(lua_State* L) {
+  lua_newtable(L);
+  lua_pushcfunction(L, LuaClientCount);
+  lua_setfield(L, -2, "client_count");
+  lua_pushcfunction(L, LuaLog);
+  lua_setfield(L, -2, "log");
+  lua_pushcfunction(L, LuaIsConnected);
+  lua_setfield(L, -2, "is_connected");
+  lua_pushcfunction(L, LuaConnect);
+  lua_setfield(L, -2, "connect");
+  lua_pushcfunction(L, LuaDisconnect);
+  lua_setfield(L, -2, "disconnect");
+  lua_pushcfunction(L, LuaScreencap);
+  lua_setfield(L, -2, "screencap");
+  lua_pushcfunction(L, LuaVersion);
+  lua_setfield(L, -2, "version");
+  lua_pushcfunction(L, LuaRestart);
+  lua_setfield(L, -2, "restart");
+  lua_pushcfunction(L, LuaQuit);
+  lua_setfield(L, -2, "quit");
+  lua_pushcfunction(L, LuaPress);
+  lua_setfield(L, -2, "press");
+  lua_pushcfunction(L, LuaUpload);
+  lua_setfield(L, -2, "upload");
+  lua_pushcfunction(L, LuaSendRaw);
+  lua_setfield(L, -2, "raw");
+  lua_pushcfunction(L, LuaSleep);
+  lua_setfield(L, -2, "sleep");
+  lua_pushcfunction(L, LuaBindKey);
+  lua_setfield(L, -2, "bind_key");
+  lua_pushcfunction(L, LuaClearKeybinds);
+  lua_setfield(L, -2, "clear_keybinds");
+  lua_setglobal(L, "rmi");
+}
+
+bool RunLuaScript(LuaState* state,
+                  std::vector<std::unique_ptr<ClientSlot>>* slots,
+                  LuaScript* script) {
+  if (!state || !slots || !script) {
+    return false;
+  }
+  lua_State* L = luaL_newstate();
+  if (!L) {
+    script->last_error = "Failed to initialize Lua state.";
+    return false;
+  }
+  luaL_openlibs(L);
+  LuaContext ctx;
+  ctx.state = state;
+  ctx.slots = slots;
+  lua_pushlightuserdata(L, (void*)&kLuaContextKey);
+  lua_pushlightuserdata(L, &ctx);
+  lua_settable(L, LUA_REGISTRYINDEX);
+  RegisterLuaApi(L);
+  if (luaL_loadstring(L, script->code.c_str()) != LUA_OK) {
+    script->last_error = lua_tostring(L, -1);
+    lua_close(L);
+    return false;
+  }
+  if (lua_pcall(L, 0, LUA_MULTRET, 0) != LUA_OK) {
+    script->last_error = lua_tostring(L, -1);
+    lua_close(L);
+    return false;
+  }
+  script->last_error.clear();
+  lua_close(L);
+  return true;
+}
+
+bool RunLuaScriptByName(LuaState* state,
+                        std::vector<std::unique_ptr<ClientSlot>>* slots,
+                        const std::string& name) {
+  if (!state || !slots) {
+    return false;
+  }
+  const int index = FindLuaScriptIndex(*state, name);
+  if (index < 0) {
+    return false;
+  }
+  LuaScript& script = state->scripts[static_cast<size_t>(index)];
+  const bool ok = RunLuaScript(state, slots, &script);
+  if (!ok && !script.last_error.empty()) {
+    AppendLuaOutput(state, "Lua error: " + script.last_error);
+  }
+  return ok;
+}
+
+void HandleLuaKeybinds(LuaState* state,
+                       std::vector<std::unique_ptr<ClientSlot>>* slots,
+                       const SDL_KeyboardEvent& event) {
+  if (!state || !slots) {
+    return;
+  }
+  if (event.repeat != 0) {
+    return;
+  }
+  const SDL_Keymod mods = static_cast<SDL_Keymod>(event.keysym.mod);
+  for (const auto& bind : state->keybinds) {
+    if (bind.scancode != event.keysym.scancode) {
+      continue;
+    }
+    if ((mods & bind.mods) != bind.mods) {
+      continue;
+    }
+    RunLuaScriptByName(state, slots, bind.script_name);
+  }
+}
+#else
+bool RunLuaScript(LuaState* state,
+                  std::vector<std::unique_ptr<ClientSlot>>* slots,
+                  LuaScript* script) {
+  (void)state;
+  (void)slots;
+  if (script) {
+    script->last_error = "Lua support not available.";
+  }
+  return false;
+}
+
+bool RunLuaScriptByName(LuaState* state,
+                        std::vector<std::unique_ptr<ClientSlot>>* slots,
+                        const std::string& name) {
+  (void)state;
+  (void)slots;
+  (void)name;
+  return false;
+}
+
+void HandleLuaKeybinds(LuaState* state,
+                       std::vector<std::unique_ptr<ClientSlot>>* slots,
+                       const SDL_KeyboardEvent& event) {
+  (void)state;
+  (void)slots;
+  (void)event;
+}
+#endif
+
+bool LoadSettings(ClientConfig* config,
+                  int* connect_tab,
+                  float* ui_scale,
+                  std::string* error) {
   if (!config) {
     if (error) {
       *error = "Invalid config pointer.";
@@ -1015,13 +1646,24 @@ bool LoadSettings(ClientConfig* config, int* connect_tab, std::string* error) {
         }
       } catch (...) {
       }
+    } else if (key == "ui_scale") {
+      try {
+        float scale = std::stof(value);
+        if (ui_scale) {
+          *ui_scale = std::clamp(scale, 0.5f, 3.0f);
+        }
+      } catch (...) {
+      }
     }
   }
 
   return true;
 }
 
-bool SaveSettings(const ClientConfig& config, int connect_tab, std::string* error) {
+bool SaveSettings(const ClientConfig& config,
+                  int connect_tab,
+                  float ui_scale,
+                  std::string* error) {
   const std::filesystem::path path = SettingsPath();
   std::ofstream file(path, std::ios::trunc);
   if (!file) {
@@ -1036,6 +1678,7 @@ bool SaveSettings(const ClientConfig& config, int connect_tab, std::string* erro
   file << "username=" << EscapeSetting(config.username) << "\n";
   file << "password=" << EscapeSetting(config.password) << "\n";
   file << "connect_tab=" << connect_tab << "\n";
+  file << "ui_scale=" << ui_scale << "\n";
   if (!file.good()) {
     if (error) {
       *error = "Failed to save settings file.";
@@ -1570,6 +2213,173 @@ static void DrawFileBrowser(RmiClient& client, FileBrowserState& state, bool is_
   }
 }
 
+static void DrawLuaPanel(LuaState& state,
+                         std::vector<std::unique_ptr<ClientSlot>>& slots) {
+  auto ensure_editor = [](LuaScript& script) {
+    if (script.editor) {
+      return;
+    }
+    script.editor = std::make_unique<TextEditor>();
+    script.editor->SetLanguageDefinition(TextEditor::LanguageDefinition::Lua());
+    script.editor->SetPalette(TextEditor::GetLightPalette());
+    script.editor->SetTabSize(2);
+    script.editor->SetShowWhitespaces(false);
+    script.editor->SetReadOnly(false);
+    script.editor->SetColorizerEnable(true);
+    script.editor->SetText(script.code);
+  };
+
+  ImGui::BeginChild("lua_panel",
+                    ImVec2(0, 0),
+                    false,
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+
+  const float total_width = ImGui::GetContentRegionAvail().x;
+  float left_width = std::min(260.0f, total_width * 0.35f);
+  if (left_width < 180.0f) {
+    left_width = std::max(160.0f, total_width * 0.28f);
+  }
+
+  ImGui::BeginChild("lua_left",
+                    ImVec2(left_width, 0),
+                    true,
+                    ImGuiWindowFlags_NoScrollWithMouse);
+  ImGui::Text("Scripts");
+  if (state.new_script_name.empty()) {
+    state.new_script_name = "script";
+  }
+  ImGui::InputText("New Script", &state.new_script_name);
+  if (ImGui::Button("Add Script", ImVec2(-1, 0))) {
+    LuaScript script;
+    script.name = MakeUniqueScriptName(state, TrimCopy(state.new_script_name));
+    script.code = "-- New script\n";
+    state.scripts.push_back(std::move(script));
+    state.selected = static_cast<int>(state.scripts.size()) - 1;
+  }
+  ImGui::Separator();
+
+  for (size_t i = 0; i < state.scripts.size(); ++i) {
+    const bool selected = (state.selected == static_cast<int>(i));
+    if (ImGui::Selectable(state.scripts[i].name.c_str(), selected)) {
+      state.selected = static_cast<int>(i);
+    }
+  }
+
+  ImGui::Separator();
+  if (state.selected >= 0 && state.selected < static_cast<int>(state.scripts.size())) {
+    LuaScript& script = state.scripts[static_cast<size_t>(state.selected)];
+    if (ImGui::Button("Run", ImVec2(-1, 0))) {
+#if defined(RMI_ENABLE_LUA)
+      if (!RunLuaScript(&state, &slots, &script)) {
+        if (!script.last_error.empty()) {
+          AppendLuaOutput(&state, "Lua error: " + script.last_error);
+        }
+      }
+#else
+      script.last_error = "Lua support not available.";
+#endif
+    }
+    if (ImGui::Button("Save", ImVec2(-1, 0))) {
+      std::string error;
+      if (!SaveLuaScript(&state, &script, &error)) {
+        script.last_error = error;
+      }
+    }
+    if (ImGui::Button("Delete", ImVec2(-1, 0))) {
+      const std::string removed = script.name;
+      state.scripts.erase(state.scripts.begin() + static_cast<long>(state.selected));
+      state.keybinds.erase(
+          std::remove_if(state.keybinds.begin(),
+                         state.keybinds.end(),
+                         [&removed](const LuaKeybind& bind) {
+                           return bind.script_name == removed;
+                         }),
+          state.keybinds.end());
+      if (state.scripts.empty()) {
+        state.selected = -1;
+      } else if (state.selected >= static_cast<int>(state.scripts.size())) {
+        state.selected = static_cast<int>(state.scripts.size()) - 1;
+      }
+    }
+  } else {
+    ImGui::TextDisabled("Select a script to edit.");
+  }
+
+  ImGui::Separator();
+  ImGui::Text("Keybinds");
+  if (state.keybinds.empty()) {
+    ImGui::TextDisabled("No keybinds.");
+  } else {
+    for (size_t i = 0; i < state.keybinds.size();) {
+      const LuaKeybind& bind = state.keybinds[i];
+      ImGui::Text("%s -> %s",
+                  FormatKeybind(bind).c_str(),
+                  bind.script_name.c_str());
+      ImGui::SameLine();
+      ImGui::PushID(static_cast<int>(i));
+      if (ImGui::SmallButton("x")) {
+        state.keybinds.erase(state.keybinds.begin() + static_cast<long>(i));
+        ImGui::PopID();
+        continue;
+      }
+      ImGui::PopID();
+      ++i;
+    }
+  }
+  ImGui::TextDisabled("Use rmi.bind_key(\"F5\", \"script\") in Lua.");
+
+  ImGui::EndChild();
+
+  ImGui::SameLine();
+  ImGui::BeginChild("lua_right",
+                    ImVec2(0, 0),
+                    true,
+                    ImGuiWindowFlags_NoScrollWithMouse);
+#if !defined(RMI_ENABLE_LUA)
+  ImGui::TextDisabled("Lua support not available. Install Lua and rebuild.");
+#endif
+  ImGui::TextDisabled("Lua API: rmi.client_count(), rmi.screencap(i), rmi.press(i, key), rmi.upload(i, local, remote), rmi.raw(i, cmd, timeout_ms), rmi.sleep(seconds).");
+  if (state.selected >= 0 && state.selected < static_cast<int>(state.scripts.size())) {
+    LuaScript& script = state.scripts[static_cast<size_t>(state.selected)];
+    ImGui::Text("Editing: %s", script.name.c_str());
+    if (!script.last_error.empty()) {
+      ImGui::TextWrapped("Last error: %s", script.last_error.c_str());
+    }
+    const float output_height = 140.0f;
+    float editor_height = ImGui::GetContentRegionAvail().y - output_height;
+    if (editor_height < 120.0f) {
+      editor_height = 120.0f;
+    }
+    ensure_editor(script);
+    script.editor->Render("##lua_editor", ImVec2(0, editor_height), false);
+    if (script.editor->IsTextChanged()) {
+      script.code = script.editor->GetText();
+      script.dirty = true;
+    }
+  }
+
+  ImGui::Separator();
+  ImGui::Text("Output");
+  if (ImGui::Button("Clear Output", ImVec2(120, 0))) {
+    state.output.clear();
+    state.output_version++;
+  }
+  ImGui::BeginChild("lua_output", ImVec2(0, 0), true);
+  if (state.output.empty()) {
+    ImGui::TextDisabled("No output yet.");
+  } else {
+    ImGui::TextUnformatted(state.output.c_str());
+    if (state.output_last_version != state.output_version) {
+      ImGui::SetScrollHereY(1.0f);
+    }
+  }
+  state.output_last_version = state.output_version;
+  ImGui::EndChild();
+
+  ImGui::EndChild();
+  ImGui::EndChild();
+}
+
 static bool DrawClientPanel(int index,
                             ClientSlot& slot,
                             const SettingsState& settings) {
@@ -1604,6 +2414,9 @@ static bool DrawClientPanel(int index,
   }
   if (ImGui::Button("Take Picture", ImVec2(-1, 0))) {
     slot.client.sendPressInput(27);
+  }
+  if (ImGui::Button("Open Camera", ImVec2(-1, 0))) {
+    slot.client.sendOpen("light.co.lightcamera");
   }
   if (ImGui::Button("Restart Server", ImVec2(-1, 0))) {
     slot.client.sendRestart();
@@ -2163,13 +2976,20 @@ int main(int argc, char** argv) {
 #else
   ImGui_ImplSDLRenderer_Init(renderer);
 #endif
+  ImGuiStyle base_style = ImGui::GetStyle();
+  float applied_ui_scale = -1.0f;
 
   std::vector<std::unique_ptr<ClientSlot>> slots;
   slots.push_back(std::make_unique<ClientSlot>());
   int active_slot = 0;
+  LuaState lua_state;
   SettingsState settings;
   settings.path = SettingsPath().string();
-  LoadSettings(&slots[0]->config, &slots[0]->connect_tab, &settings.error);
+  LoadSettings(&slots[0]->config,
+               &slots[0]->connect_tab,
+               &settings.ui_scale,
+               &settings.error);
+  LoadLuaScripts(&lua_state);
 
   bool running = true;
   while (running) {
@@ -2182,6 +3002,9 @@ int main(int argc, char** argv) {
       if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE &&
           event.window.windowID == SDL_GetWindowID(window)) {
         running = false;
+      }
+      if (event.type == SDL_KEYDOWN) {
+        HandleLuaKeybinds(&lua_state, &slots, event.key);
       }
     }
 
@@ -2206,6 +3029,14 @@ int main(int argc, char** argv) {
 #endif
     ImGui_ImplSDL2_NewFrame();
     ImGui::NewFrame();
+    if (settings.ui_scale != applied_ui_scale) {
+      ImGuiStyle& style = ImGui::GetStyle();
+      style = base_style;
+      style.ScaleAllSizes(settings.ui_scale);
+      ImGuiIO& io = ImGui::GetIO();
+      io.FontGlobalScale = settings.ui_scale;
+      applied_ui_scale = settings.ui_scale;
+    }
 
     const ImGuiIO& io = ImGui::GetIO();
     ImGui::SetNextWindowPos(ImVec2(0, 0));
@@ -2217,6 +3048,8 @@ int main(int argc, char** argv) {
                      ImGuiWindowFlags_NoMove |
                      ImGuiWindowFlags_NoCollapse |
                      ImGuiWindowFlags_MenuBar);
+    bool settings_changed = false;
+    bool settings_changed_primary = false;
     if (ImGui::BeginMenuBar()) {
       if (ImGui::BeginMenu("Connection")) {
         ClientSlot& menu_slot = *slots[active_slot];
@@ -2230,6 +3063,20 @@ int main(int argc, char** argv) {
         }
         ImGui::EndMenu();
       }
+      if (ImGui::BeginMenu("View")) {
+        float prev_scale = settings.ui_scale;
+        if (ImGui::SliderFloat("UI Scale", &settings.ui_scale, 0.75f, 2.0f, "%.2f")) {
+          settings.ui_scale = std::clamp(settings.ui_scale, 0.5f, 3.0f);
+          if (settings.ui_scale != prev_scale) {
+            settings_changed_primary = true;
+          }
+        }
+        if (ImGui::MenuItem("Reset Scale")) {
+          settings.ui_scale = 1.0f;
+          settings_changed_primary = true;
+        }
+        ImGui::EndMenu();
+      }
       ImGui::EndMenuBar();
     }
 
@@ -2239,7 +3086,12 @@ int main(int argc, char** argv) {
       slots.push_back(std::make_unique<ClientSlot>());
       active_slot = static_cast<int>(slots.size() - 1);
     }
+    bool show_lua_panel = false;
     if (ImGui::BeginTabBar("client_tabs")) {
+      if (ImGui::BeginTabItem("Lua")) {
+        show_lua_panel = true;
+        ImGui::EndTabItem();
+      }
       for (size_t i = 0; i < slots.size();) {
         std::string label = "Client " + std::to_string(i + 1) +
             "###client_tab_" + std::to_string(i);
@@ -2266,31 +3118,33 @@ int main(int argc, char** argv) {
     }
 
     ClientSlot& active = *slots[active_slot];
-    ImGui::Text("Connect and send AUTH/SCREENCAP/RESTART/QUIT/PRESS/VERSION/UPLOAD framed commands.");
-    ImGui::Separator();
-
-    const ClientStatus status = active.client.status();
-    const bool is_connected = status == ClientStatus::Connected;
-    const bool is_connecting = status == ClientStatus::Connecting;
-    if (!is_connected) {
-      ImGui::BeginDisabled(is_connecting);
-      if (ImGui::Button("Connect", ImVec2(140, 0))) {
-        active.show_connect_popup = true;
-      }
-      ImGui::EndDisabled();
-      ImGui::SameLine();
-      if (is_connecting) {
-        ImGui::TextDisabled("Connecting...");
-      } else {
-        ImGui::TextDisabled("Not connected");
-      }
-      ImGui::Separator();
-    }
-
-    bool settings_changed = false;
-    bool settings_changed_primary = false;
     settings_changed = DrawConnectPopup(active, active_slot, &active.show_connect_popup);
-    settings_changed |= DrawClientPanel(active_slot, active, settings);
+    if (show_lua_panel) {
+      DrawLuaPanel(lua_state, slots);
+    } else {
+      ImGui::Text("Connect and send AUTH/SCREENCAP/RESTART/QUIT/PRESS/VERSION/UPLOAD/OPEN framed commands.");
+      ImGui::Separator();
+
+      const ClientStatus status = active.client.status();
+      const bool is_connected = status == ClientStatus::Connected;
+      const bool is_connecting = status == ClientStatus::Connecting;
+      if (!is_connected) {
+        ImGui::BeginDisabled(is_connecting);
+        if (ImGui::Button("Connect", ImVec2(140, 0))) {
+          active.show_connect_popup = true;
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (is_connecting) {
+          ImGui::TextDisabled("Connecting...");
+        } else {
+          ImGui::TextDisabled("Not connected");
+        }
+        ImGui::Separator();
+      }
+
+      settings_changed |= DrawClientPanel(active_slot, active, settings);
+    }
     if (active_slot == 0 && settings_changed) {
       settings_changed_primary = true;
     }
@@ -2312,7 +3166,10 @@ int main(int argc, char** argv) {
     SDL_RenderPresent(renderer);
 
     if (settings.dirty && SDL_GetTicks64() - settings.last_change_ticks > 500) {
-      if (SaveSettings(slots[0]->config, slots[0]->connect_tab, &settings.error)) {
+      if (SaveSettings(slots[0]->config,
+                       slots[0]->connect_tab,
+                       settings.ui_scale,
+                       &settings.error)) {
         settings.dirty = false;
         settings.error.clear();
       }
@@ -2341,7 +3198,10 @@ int main(int argc, char** argv) {
   ImGui_ImplSDLRenderer_Shutdown();
 #endif
   if (settings.dirty) {
-    SaveSettings(slots[0]->config, slots[0]->connect_tab, &settings.error);
+    SaveSettings(slots[0]->config,
+                 slots[0]->connect_tab,
+                 settings.ui_scale,
+                 &settings.error);
   }
 
   ImGui_ImplSDL2_Shutdown();

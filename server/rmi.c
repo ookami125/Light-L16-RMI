@@ -18,10 +18,10 @@
 #include <sys/ptrace.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
-#include <linux/input.h>
 #include <sys/stat.h>
 #include <limits.h>
 #include <dirent.h>
+#include <linux/input.h>
 
 #include "rmi_version.h"
 #include "rmi_protocol.h"
@@ -1329,6 +1329,257 @@ send_keyevent_input(int keycode)
 }
 
 static int
+open_app(const char *target)
+{
+    pid_t pid;
+    int status;
+    int runcon_ok;
+    int sh_ok;
+    int am_ok;
+    int cmd_ok;
+    int monkey_ok;
+    bool is_component;
+    const char *prefix;
+
+    if (target == NULL || target[0] == '\0')
+    {
+        return -1;
+    }
+
+    prefix = "package:";
+    if (strncmp(target, prefix, strlen(prefix)) == 0)
+    {
+        target += strlen(prefix);
+        while (*target == ' ' || *target == '\t')
+        {
+            target++;
+        }
+        if (target[0] == '\0')
+        {
+            return -1;
+        }
+    }
+
+    is_component = (strchr(target, '/') != NULL);
+
+    runcon_ok = (access("/system/bin/runcon", X_OK) == 0);
+    sh_ok = (access("/system/bin/sh", X_OK) == 0);
+    am_ok = (access("/system/bin/am", X_OK) == 0);
+    cmd_ok = (access("/system/bin/cmd", X_OK) == 0);
+    monkey_ok = (access("/system/bin/monkey", X_OK) == 0);
+
+    pid = fork();
+    if (pid == -1)
+    {
+        fprintf(stderr, "Syscall error: fork at line %d with code %d.\n",
+                __LINE__, errno);
+        return -1;
+    }
+
+    if (pid == 0)
+    {
+        set_shell_env();
+        log_identity("before runcon");
+        if (runcon_ok)
+        {
+            if (monkey_ok && !is_component)
+            {
+                if (sh_ok)
+                {
+                    fprintf(stderr, "RMI open: exec /system/bin/runcon sh monkey\n");
+                    execl("/system/bin/runcon", "runcon", "u:r:shell:s0",
+                          "/system/bin/sh", "/system/bin/monkey", "-p", target,
+                          "-c", "android.intent.category.LAUNCHER", "1",
+                          (char *)NULL);
+                    fprintf(stderr, "RMI open: exec /system/bin/runcon sh monkey failed: %d\n",
+                            errno);
+                }
+                fprintf(stderr, "RMI open: exec /system/bin/runcon monkey\n");
+                execl("/system/bin/runcon", "runcon", "u:r:shell:s0",
+                      "/system/bin/monkey", "-p", target,
+                      "-c", "android.intent.category.LAUNCHER", "1",
+                      (char *)NULL);
+                fprintf(stderr, "RMI open: exec /system/bin/runcon monkey failed: %d\n",
+                        errno);
+            }
+            if (sh_ok && am_ok)
+            {
+                fprintf(stderr, "RMI open: exec /system/bin/runcon shell am\n");
+                if (is_component)
+                {
+                    execl("/system/bin/runcon", "runcon", "u:r:shell:s0",
+                          "/system/bin/sh", "/system/bin/am", "start",
+                          "-n", target, (char *)NULL);
+                }
+                else
+                {
+                    execl("/system/bin/runcon", "runcon", "u:r:shell:s0",
+                          "/system/bin/sh", "/system/bin/am", "start",
+                          "-a", "android.intent.action.MAIN",
+                          "-c", "android.intent.category.LAUNCHER",
+                          "-p", target, (char *)NULL);
+                }
+                fprintf(stderr, "RMI open: exec /system/bin/runcon am failed: %d\n",
+                        errno);
+            }
+            if (cmd_ok)
+            {
+                if (sh_ok)
+                {
+                    fprintf(stderr, "RMI open: exec /system/bin/runcon sh cmd\n");
+                    if (is_component)
+                    {
+                        execl("/system/bin/runcon", "runcon", "u:r:shell:s0",
+                              "/system/bin/sh", "/system/bin/cmd", "activity",
+                              "start", "-n", target, (char *)NULL);
+                    }
+                    else
+                    {
+                        execl("/system/bin/runcon", "runcon", "u:r:shell:s0",
+                              "/system/bin/sh", "/system/bin/cmd", "activity",
+                              "start", "-a", "android.intent.action.MAIN",
+                              "-c", "android.intent.category.LAUNCHER",
+                              "-p", target, (char *)NULL);
+                    }
+                    fprintf(stderr, "RMI open: exec /system/bin/runcon sh cmd failed: %d\n",
+                            errno);
+                }
+                fprintf(stderr, "RMI open: exec /system/bin/runcon cmd\n");
+                if (is_component)
+                {
+                    execl("/system/bin/runcon", "runcon", "u:r:shell:s0",
+                          "/system/bin/cmd", "activity", "start",
+                          "-n", target, (char *)NULL);
+                }
+                else
+                {
+                    execl("/system/bin/runcon", "runcon", "u:r:shell:s0",
+                          "/system/bin/cmd", "activity", "start",
+                          "-a", "android.intent.action.MAIN",
+                          "-c", "android.intent.category.LAUNCHER",
+                          "-p", target, (char *)NULL);
+                }
+                fprintf(stderr, "RMI open: exec /system/bin/runcon cmd failed: %d\n",
+                        errno);
+            }
+        }
+
+        drop_to_shell_user();
+        log_identity("after drop");
+        if (sh_ok && am_ok)
+        {
+            fprintf(stderr, "RMI open: exec /system/bin/sh /system/bin/am\n");
+            if (is_component)
+            {
+                execl("/system/bin/sh", "sh", "/system/bin/am", "start",
+                      "-n", target, (char *)NULL);
+            }
+            else
+            {
+                execl("/system/bin/sh", "sh", "/system/bin/am", "start",
+                      "-a", "android.intent.action.MAIN",
+                      "-c", "android.intent.category.LAUNCHER",
+                      "-p", target, (char *)NULL);
+            }
+            fprintf(stderr, "RMI open: exec sh /system/bin/am failed: %d\n",
+                    errno);
+        }
+        if (am_ok)
+        {
+            fprintf(stderr, "RMI open: exec /system/bin/am\n");
+            if (is_component)
+            {
+                execl("/system/bin/am", "am", "start",
+                      "-n", target, (char *)NULL);
+            }
+            else
+            {
+                execl("/system/bin/am", "am", "start",
+                      "-a", "android.intent.action.MAIN",
+                      "-c", "android.intent.category.LAUNCHER",
+                      "-p", target, (char *)NULL);
+            }
+            fprintf(stderr, "RMI open: exec /system/bin/am failed: %d\n",
+                    errno);
+        }
+        if (cmd_ok)
+        {
+            if (sh_ok)
+            {
+                fprintf(stderr, "RMI open: exec /system/bin/sh /system/bin/cmd\n");
+                if (is_component)
+                {
+                    execl("/system/bin/sh", "sh", "/system/bin/cmd", "activity",
+                          "start", "-n", target, (char *)NULL);
+                }
+                else
+                {
+                    execl("/system/bin/sh", "sh", "/system/bin/cmd", "activity",
+                          "start", "-a", "android.intent.action.MAIN",
+                          "-c", "android.intent.category.LAUNCHER",
+                          "-p", target, (char *)NULL);
+                }
+                fprintf(stderr, "RMI open: exec sh /system/bin/cmd failed: %d\n",
+                        errno);
+            }
+            fprintf(stderr, "RMI open: exec /system/bin/cmd\n");
+            if (is_component)
+            {
+                execl("/system/bin/cmd", "cmd", "activity", "start",
+                      "-n", target, (char *)NULL);
+            }
+            else
+            {
+                execl("/system/bin/cmd", "cmd", "activity", "start",
+                      "-a", "android.intent.action.MAIN",
+                      "-c", "android.intent.category.LAUNCHER",
+                      "-p", target, (char *)NULL);
+            }
+            fprintf(stderr, "RMI open: exec /system/bin/cmd failed: %d\n",
+                    errno);
+        }
+        if (monkey_ok && !is_component)
+        {
+            if (sh_ok)
+            {
+                fprintf(stderr, "RMI open: exec /system/bin/sh /system/bin/monkey\n");
+                execl("/system/bin/sh", "sh", "/system/bin/monkey", "-p", target,
+                      "-c", "android.intent.category.LAUNCHER", "1",
+                      (char *)NULL);
+                fprintf(stderr, "RMI open: exec sh /system/bin/monkey failed: %d\n",
+                        errno);
+            }
+            fprintf(stderr, "RMI open: exec /system/bin/monkey\n");
+            execl("/system/bin/monkey", "monkey", "-p", target,
+                  "-c", "android.intent.category.LAUNCHER", "1",
+                  (char *)NULL);
+            fprintf(stderr, "RMI open: exec /system/bin/monkey failed: %d\n",
+                    errno);
+        }
+        _exit(127);
+    }
+
+    if (waitpid(pid, &status, 0) == -1)
+    {
+        return -1;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+    {
+        if (WIFEXITED(status))
+        {
+            fprintf(stderr, "RMI open: exit status %d\n", WEXITSTATUS(status));
+        }
+        else if (WIFSIGNALED(status))
+        {
+            fprintf(stderr, "RMI open: signaled %d\n", WTERMSIG(status));
+        }
+        return -1;
+    }
+
+    return 0;
+}
+
+static int
 handle_rmi_client(int client_fd, const char *user, const char *pass)
 {
     struct pollfd pfd;
@@ -1604,6 +1855,26 @@ handle_rmi_client(int client_fd, const char *user, const char *pass)
                 }
             }
             send_text(client_fd, "ERR press");
+            continue;
+        }
+
+        if (strncmp(cmd, RMI_CMD_OPEN, strlen(RMI_CMD_OPEN)) == 0)
+        {
+            char *save;
+            char *tok;
+            char *target;
+
+            tok = strtok_r(cmd, " \t", &save);
+            target = strtok_r(NULL, " \t", &save);
+            if (tok != NULL && target != NULL)
+            {
+                if (open_app(target) == 0)
+                {
+                    send_text(client_fd, RMI_RESP_OK);
+                    continue;
+                }
+            }
+            send_text(client_fd, "ERR open");
             continue;
         }
 

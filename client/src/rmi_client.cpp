@@ -52,6 +52,30 @@ bool ContainsWhitespace(const std::string& value) {
   return false;
 }
 
+std::string TrimWhitespace(const std::string& value) {
+  size_t start = 0;
+  while (start < value.size() &&
+         std::isspace(static_cast<unsigned char>(value[start]))) {
+    ++start;
+  }
+  size_t end = value.size();
+  while (end > start &&
+         std::isspace(static_cast<unsigned char>(value[end - 1]))) {
+    --end;
+  }
+  return value.substr(start, end - start);
+}
+
+std::string NormalizeOpenTarget(const std::string& target) {
+  std::string trimmed = TrimWhitespace(target);
+  const char prefix[] = "package:";
+  if (trimmed.rfind(prefix, 0) == 0) {
+    trimmed.erase(0, sizeof(prefix) - 1);
+    trimmed = TrimWhitespace(trimmed);
+  }
+  return trimmed;
+}
+
 }  // namespace
 
 RmiClient::RmiClient() : status_(ClientStatus::Disconnected), stop_(false) {
@@ -138,6 +162,21 @@ void RmiClient::sendPressInput(int keycode) {
   queueMessage(message);
 }
 
+void RmiClient::sendOpen(const std::string& target) {
+  if (status_.load() != ClientStatus::Connected) {
+    return;
+  }
+  std::string normalized = NormalizeOpenTarget(target);
+  if (normalized.empty()) {
+    setError("Open target is empty.");
+    return;
+  }
+  OutboundMessage message;
+  message.message = std::string(RMI_CMD_OPEN) + " " + normalized;
+  message.response = ResponseType::Ok;
+  queueMessage(message);
+}
+
 void RmiClient::sendUpload(const std::string& local_path, const std::string& remote_path) {
   if (status_.load() != ClientStatus::Connected) {
     return;
@@ -159,6 +198,55 @@ void RmiClient::sendUploadAndRestart(const std::string& local_path, const std::s
   message.upload_local_path = local_path;
   message.upload_remote_path = remote_path;
   queueMessage(message);
+}
+
+bool RmiClient::sendRawCommand(const std::string& command,
+                               std::string* response,
+                               std::string* error,
+                               int timeout_ms) {
+  if (status_.load() != ClientStatus::Connected) {
+    if (error) {
+      *error = "Client not connected.";
+    }
+    return false;
+  }
+  if (command.empty()) {
+    if (error) {
+      *error = "Command is empty.";
+    }
+    return false;
+  }
+  if (timeout_ms <= 0) {
+    timeout_ms = kAuthTimeoutMs;
+  }
+
+  auto raw = std::make_shared<RawResponse>();
+  OutboundMessage message;
+  message.message = command;
+  message.response = ResponseType::Raw;
+  message.raw_response = raw;
+  message.raw_timeout_ms = timeout_ms;
+  queueMessage(message);
+
+  std::unique_lock<std::mutex> lock(raw->mutex);
+  if (!raw->cv.wait_for(lock,
+                        std::chrono::milliseconds(timeout_ms),
+                        [&raw]() { return raw->done; })) {
+    if (error) {
+      *error = "Timed out waiting for server response.";
+    }
+    return false;
+  }
+  if (response) {
+    *response = raw->payload;
+  }
+  if (!raw->error.empty()) {
+    if (error) {
+      *error = raw->error;
+    }
+    return false;
+  }
+  return raw->ok;
 }
 
 void RmiClient::sendVersion() {
@@ -501,7 +589,24 @@ void RmiClient::workerLoop(ClientConfig config) {
     }
 
     if (has_message && !message.message.empty()) {
+      auto finish_raw = [&message](bool ok,
+                                   const std::string& payload,
+                                   const std::string& err) {
+        if (!message.raw_response) {
+          return;
+        }
+        std::lock_guard<std::mutex> lock(message.raw_response->mutex);
+        message.raw_response->payload = payload;
+        message.raw_response->error = err;
+        message.raw_response->ok = ok;
+        message.raw_response->done = true;
+        message.raw_response->cv.notify_one();
+      };
+
       if (!sendFrame(connection, message.message, &error)) {
+        if (message.response == ResponseType::Raw) {
+          finish_raw(false, std::string(), error);
+        }
         setError(error);
         setStatus(ClientStatus::Error);
         return;
@@ -627,6 +732,27 @@ void RmiClient::workerLoop(ClientConfig config) {
           result.in_progress = false;
           ++result.version;
         }
+      } else if (message.response == ResponseType::Raw) {
+        std::vector<uint8_t> response;
+        const int timeout = (message.raw_timeout_ms > 0)
+            ? message.raw_timeout_ms
+            : kAuthTimeoutMs;
+        if (!receiveFrameSkippingHeartbeats(connection,
+                                            &response,
+                                            timeout,
+                                            kMaxFrameBytes,
+                                            &error)) {
+          finish_raw(false, std::string(), error);
+          setError(error);
+          setStatus(ClientStatus::Error);
+          return;
+        }
+        const bool is_error = PayloadStartsWith(response, RMI_RESP_ERR_PREFIX);
+        const std::string payload = PayloadToString(response);
+        if (is_error) {
+          setError(payload);
+        }
+        finish_raw(!is_error, payload, is_error ? payload : std::string());
       }
     }
 
